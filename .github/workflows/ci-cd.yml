@@ -16,37 +16,81 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        # Baja el código del repo
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-        # Instala Python 3.12 para correr tests
 
-      - name: Install deps for tests
+      - name: Debug: show repo & check requirements
         run: |
-          python -m pip install --upgrade pip
-          pip install -r app/requirements.txt
-          pip install flask
-          pip install pytest
-        # Dependencias de aplicación + pytest
+          echo "=== pwd ==="
+          pwd
+          echo "=== repo root ==="
+          ls -la
+          echo "=== app directory ==="
+          ls -la app || true
+          echo "=== show app/requirements.txt (if present) ==="
+          if [ -f app/requirements.txt ]; then
+            echo "FOUND app/requirements.txt:"
+            sed -n '1,200p' app/requirements.txt
+          else
+            echo "ERROR: app/requirements.txt NOT FOUND" >&2
+            exit 2
+          fi
 
-      - name: Run unit tests
+      - name: Install deps and verify Flask
+        run: |
+          set -euo pipefail
+          echo "python: $(python --version)"
+          echo "pip: $(python -m pip --version)"
+          python -m pip install --upgrade pip setuptools wheel
+          echo "Installing from app/requirements.txt..."
+          python -m pip install -r app/requirements.txt -v
+          echo "Installing pytest (explicit)..."
+          python -m pip install pytest -v
+          echo "Installed packages:"
+          python -m pip list --format=columns | sed -n '1,200p'
+
+          echo "Verifying import flask..."
+          python - <<'PY'
+import sys
+try:
+    import flask
+    v = getattr(flask, "__version__", "unknown")
+    print("flask import OK, version:", v)
+except Exception as e:
+    print("flask import FAILED:", type(e).__name__, e, file=sys.stderr)
+    sys.exit(3)
+PY
+
+      - name: Run unit tests (fail if none collected)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
+          set -o pipefail
           echo "PYTHONPATH=$PYTHONPATH"
-          pytest -q tests/ -vv
+          pytest -q tests/ -vv || PY_EXIT=$? && true
+          # capture exit code
+          PY_EXIT=${PY_EXIT:-0}
+          echo "pytest exit code: $PY_EXIT"
+          if [ "$PY_EXIT" -eq 5 ]; then
+            echo "❌ Pytest found no tests (exit code 5) — failing workflow." >&2
+            exit 1
+          fi
+          if [ "$PY_EXIT" -ne 0 ]; then
+            echo "❌ Pytest failed (exit code $PY_EXIT)." >&2
+            exit $PY_EXIT
+          fi
+          echo "✅ Tests passed."
 
       - name: Lint Dockerfile (hadolint)
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
         continue-on-error: true
-        # Revisa buenas prácticas del Dockerfile
 
-  # ===== Build & Push imagen =====
+  # ===== Build & Push image =====
   build-and-push:
     needs: ci
     runs-on: ubuntu-latest
@@ -68,18 +112,15 @@ jobs:
             VERSION="0.0.0-${SHORT_SHA}"
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-        # Etiqueta la imagen con tag semántico si existe, si no usa el SHA corto
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-        # Autenticación segura en Docker Hub
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-        # Permite builds multi-arquitectura si quisieras (amd64/arm64)
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -95,7 +136,6 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
           cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:buildcache
           cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
-        # Construye y publica la imagen versionada y latest
 
       - name: Scan image with Trivy
         uses: aquasecurity/trivy-action@0.22.0
@@ -103,16 +143,12 @@ jobs:
           image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.version }}
           format: 'table'
           exit-code: '0'
-        # Escaneo de vulnerabilidades (ajusta exit-code a '1' para bloquear)
 
   # ===== CD: despliegue remoto por SSH =====
-  
-
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
-      # Gate: ¿hay secrets?
       - name: Gate deploy (check secrets)
         id: gate
         env:
@@ -135,7 +171,6 @@ jobs:
         if: steps.gate.outputs.ok == 'true'
         uses: actions/checkout@v4
 
-      # Reachability 22/tcp
       - name: Check SSH reachability
         if: steps.gate.outputs.ok == 'true'
         id: reach
